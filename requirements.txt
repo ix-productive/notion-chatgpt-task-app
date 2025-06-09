@@ -1,6 +1,5 @@
 streamlit
 openai
-requests
+notion-client
 python-dotenv
 dateparser
-
