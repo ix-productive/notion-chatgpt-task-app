@@ -1,119 +1,100 @@
-import os
-import json
-import re
 import streamlit as st
+import os
+import requests
+from datetime import datetime
 import dateparser
 from openai import OpenAI
-from dotenv import load_dotenv
-from datetime import datetime
 
-# Load environment variables
-load_dotenv()
+# Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-st.title("Notion & ChatGPT Task App")
-st.write("Describe your task in natural language. GPT will suggest task titles and GTD contexts.")
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 
-# --- Task input and auto-trigger on input change ---
-if "user_input" not in st.session_state:
-    st.session_state.user_input = ""
+st.title("Notion & ChatGPT Task APP")
 
-new_input = st.text_input("What task do you want to add?", value=st.session_state.user_input, key="task_input")
+# Task input
+user_input = st.text_input("Describe your task (e.g., 'Eat dinner today at 9pm'):")
 
-if new_input.strip() and new_input != st.session_state.user_input:
-    st.session_state.user_input = new_input
-    for key in [
-        "titles", "contexts", "due_date",
-        "selected_title", "selected_context",
-        "final_title", "final_context", "options_generated"
-    ]:
-        if key in st.session_state:
-            del st.session_state[key]
-    st.rerun()
+# Function to extract date and time
+def extract_datetime(text):
+    parsed = dateparser.parse(text)
+    if parsed:
+        date_str = parsed.date().isoformat()
+        time_str = parsed.strftime("%H:%M") if parsed.time() != datetime.min.time() else ""
+        return date_str, time_str
+    return None, None
 
-# --- Generate GPT options ---
-if st.session_state.user_input and "options_generated" not in st.session_state:
-    prompt = f"""
-You are a task assistant using the GTD method. Based on this input:
-
-\"{st.session_state.user_input}\"
-
-Respond only with a JSON object like this:
-
-{{
-  "titles": ["title 1", "title 2", "title 3", "title 4", "title 5", "title 6"],
-  "contexts": ["context 1", "context 2", "context 3", "context 4", "context 5", "context 6"],
-  "due_date": "next Friday"
-}}
-
-- Titles should be short and distinct
-- Contexts must be GTD-style categories (like Computer, Phone, Errands — no @ symbols)
-- Return exactly 6 distinct suggestions for both titles and contexts
-- Leave due_date empty if none mentioned
-- Respond with valid JSON only
-"""
-
+# Generate suggestions from OpenAI
+def get_suggestions(prompt):
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a helpful assistant that rewrites task titles and GTD-style context labels. Respond only in JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.7
+    )
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            temperature=0.7,
-            messages=[{"role": "user", "content": prompt}]
-        )
-
-        content = response.choices[0].message.content.strip()
-        match = re.search(r'\{.*\}', content, re.DOTALL)
-        if not match:
-            raise ValueError("No JSON object found.")
-
-        data = json.loads(match.group(0))
-        st.session_state.titles = data.get("titles", [])
-        st.session_state.contexts = data.get("contexts", [])
-        st.session_state.due_date = data.get("due_date", "")
-        st.session_state.options_generated = True
-
+        raw_output = response.choices[0].message.content
+        data = eval(raw_output.strip())  # expected to be a dict with 'titles' and 'contexts'
+        return data.get("titles", []), data.get("contexts", [])
     except Exception as e:
-        st.error("GPT response error.")
-        st.text(str(e))
+        st.error("Failed to parse GPT response")
+        return [], []
 
-# --- UI for selecting/editing task properties ---
-if st.session_state.get("options_generated", False):
-    st.subheader("Choose and Customize")
+# Process input
+if user_input:
+    prompt = f"Generate 6 suggested task titles and 6 GTD-style context tags (like Home, Computer, Errands, Calls) for: '{user_input}'. Return JSON like: {{ \"titles\": [...], \"contexts\": [...] }}"
+    titles, contexts = get_suggestions(prompt)
 
-    title_choice = st.selectbox("Choose a task title", st.session_state.titles, key="title_select")
-    if st.button("Confirm this title"):
-        st.session_state.selected_title = title_choice
-
-    editable_title = st.text_input(
-        "Edit task title",
-        value=st.session_state.get("selected_title", st.session_state.titles[0]),
-        key="final_title"
-    )
-
-    context_choice = st.selectbox("Choose a GTD context", st.session_state.contexts, key="context_select")
-    if st.button("Confirm this context"):
-        st.session_state.selected_context = context_choice
-
-    editable_context = st.text_input(
-        "Edit GTD context",
-        value=st.session_state.get("selected_context", st.session_state.contexts[0]),
-        key="final_context"
-    )
-
-    # --- Due date parsing ---
-    due_input = st.text_input("Due date (e.g., 'tomorrow at 5pm')", value=st.session_state.get("due_date", ""), key="final_due")
-    parsed_due = dateparser.parse(due_input)
-
-    if parsed_due:
-        input_lower = due_input.lower()
-        has_time = any(x in input_lower for x in ["am", "pm", ":", "morning", "evening", "noon", "night"])
-        if has_time:
-            formatted_due = parsed_due.strftime("%Y-%m-%d %H:%M")
-        else:
-            formatted_due = parsed_due.strftime("%Y-%m-%d")
+    if titles:
+        selected_title = st.selectbox("Select a Task Title:", titles)
     else:
-        formatted_due = due_input
+        selected_title = st.text_input("Manually enter task title:")
 
-    st.markdown("### Final Task Preview")
-    st.write(f"**Title:** {editable_title}")
-    st.write(f"**Context:** {editable_context}")
-    st.write(f"**Due Date:** {formatted_due}")
+    if contexts:
+        selected_contexts = st.multiselect("Select one or more GTD Contexts:", contexts)
+    else:
+        selected_contexts = st.multiselect("Manually enter GTD Contexts:", [])
+
+    # Date & Time Handling
+    default_date, default_time = extract_datetime(user_input)
+
+    due_date = st.date_input("Due Date:", value=datetime.strptime(default_date, "%Y-%m-%d") if default_date else None)
+    due_time = st.time_input("Time (optional):", value=datetime.strptime(default_time, "%H:%M").time() if default_time else datetime.now().time()) if default_time else None
+
+    # Submit to Notion
+    if st.button("Add Task to Notion"):
+        headers = {
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Content-Type": "application/json",
+            "Notion-Version": "2022-06-28"
+        }
+
+        # Build the payload
+        properties = {
+            "Name": {
+                "title": [{"text": {"content": selected_title}}]
+            },
+            "Context": {
+                "multi_select": [{"name": c} for c in selected_contexts]
+            },
+            "Due": {
+                "date": {
+                    "start": f"{due_date}T{due_time.strftime('%H:%M:%S')}" if due_time else f"{due_date}"
+                }
+            }
+        }
+
+        payload = {
+            "parent": {"database_id": NOTION_DATABASE_ID},
+            "properties": properties
+        }
+
+        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload)
+
+        if response.status_code == 200:
+            st.success("Task added to Notion successfully!")
+        else:
+            st.error(f"Failed to add task: {response.text}")
