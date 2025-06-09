@@ -1,100 +1,78 @@
-import streamlit as st
 import os
-import requests
-from datetime import datetime
-import dateparser
+import streamlit as st
 from openai import OpenAI
+from notion_client import Client as NotionClient
+import dateparser
+from dotenv import load_dotenv
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Load environment variables
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+notion_token = os.getenv("NOTION_TOKEN")
+notion_database_id = os.getenv("NOTION_DATABASE_ID")
 
-NOTION_TOKEN = os.getenv("NOTION_TOKEN")
-NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+# Initialize clients
+client = OpenAI(api_key=openai_api_key)
+notion = NotionClient(auth=notion_token)
 
-st.title("Notion & ChatGPT Task APP")
+st.title("Notion & ChatGPT Task App")
 
-# Task input
-user_input = st.text_input("Describe your task (e.g., 'Eat dinner today at 9pm'):")
+user_input = st.text_input("Describe your task")
 
-# Function to extract date and time
-def extract_datetime(text):
-    parsed = dateparser.parse(text)
-    if parsed:
-        date_str = parsed.date().isoformat()
-        time_str = parsed.strftime("%H:%M") if parsed.time() != datetime.min.time() else ""
-        return date_str, time_str
-    return None, None
-
-# Generate suggestions from OpenAI
-def get_suggestions(prompt):
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": "You are a helpful assistant that rewrites task titles and GTD-style context labels. Respond only in JSON."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7
-    )
-    try:
-        raw_output = response.choices[0].message.content
-        data = eval(raw_output.strip())  # expected to be a dict with 'titles' and 'contexts'
-        return data.get("titles", []), data.get("contexts", [])
-    except Exception as e:
-        st.error("Failed to parse GPT response")
-        return [], []
-
-# Process input
 if user_input:
-    prompt = f"Generate 6 suggested task titles and 6 GTD-style context tags (like Home, Computer, Errands, Calls) for: '{user_input}'. Return JSON like: {{ \"titles\": [...], \"contexts\": [...] }}"
-    titles, contexts = get_suggestions(prompt)
+    prompt = f"""You are helping someone break down their task entry into Notion. 
+    Given this input: "{user_input}", return exactly:
+    1. 6 title suggestions for the task.
+    2. 6 GTD context suggestions, like Computer, Home, Phone, etc. (no @ symbols).
+    3. If any due date or time is mentioned, extract it clearly in natural language (like 'today at 9pm', 'in two days', etc.).
 
-    if titles:
-        selected_title = st.selectbox("Select a Task Title:", titles)
-    else:
-        selected_title = st.text_input("Manually enter task title:")
+    Format:
+    {{
+        "titles": ["..."],
+        "contexts": ["..."],
+        "due": "..."
+    }}
+    """
 
-    if contexts:
-        selected_contexts = st.multiselect("Select one or more GTD Contexts:", contexts)
-    else:
-        selected_contexts = st.multiselect("Manually enter GTD Contexts:", [])
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        reply = response.choices[0].message.content
+        parsed = eval(reply)  # assuming GPT returns safe Python-like JSON
+        titles = parsed.get("titles", [])
+        contexts = parsed.get("contexts", [])
+        due_natural = parsed.get("due", "")
 
-    # Date & Time Handling
-    default_date, default_time = extract_datetime(user_input)
+        selected_title = st.selectbox("Choose a task title", titles)
+        selected_contexts = st.multiselect("Select GTD contexts", contexts)
 
-    due_date = st.date_input("Due Date:", value=datetime.strptime(default_date, "%Y-%m-%d") if default_date else None)
-    due_time = st.time_input("Time (optional):", value=datetime.strptime(default_time, "%H:%M").time() if default_time else datetime.now().time()) if default_time else None
-
-    # Submit to Notion
-    if st.button("Add Task to Notion"):
-        headers = {
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Content-Type": "application/json",
-            "Notion-Version": "2022-06-28"
-        }
-
-        # Build the payload
-        properties = {
-            "Name": {
-                "title": [{"text": {"content": selected_title}}]
-            },
-            "Context": {
-                "multi_select": [{"name": c} for c in selected_contexts]
-            },
-            "Due": {
-                "date": {
-                    "start": f"{due_date}T{due_time.strftime('%H:%M:%S')}" if due_time else f"{due_date}"
-                }
-            }
-        }
-
-        payload = {
-            "parent": {"database_id": NOTION_DATABASE_ID},
-            "properties": properties
-        }
-
-        response = requests.post("https://api.notion.com/v1/pages", headers=headers, json=payload)
-
-        if response.status_code == 200:
-            st.success("Task added to Notion successfully!")
+        # Date parsing
+        due_datetime = None
+        if due_natural:
+            due_datetime = dateparser.parse(due_natural)
+        if due_datetime:
+            selected_date = st.date_input("Due Date", value=due_datetime.date())
+            selected_time = st.time_input("Due Time", value=due_datetime.time())
         else:
-            st.error(f"Failed to add task: {response.text}")
+            selected_date = st.date_input("Due Date")
+            selected_time = st.time_input("Due Time")
+
+        if st.button("Create Task in Notion"):
+            notion.pages.create(
+                parent={"database_id": notion_database_id},
+                properties={
+                    "Name": {"title": [{"text": {"content": selected_title}}]},
+                    "GTD Context": {"multi_select": [{"name": ctx} for ctx in selected_contexts]},
+                    "Due": {
+                        "date": {
+                            "start": f"{selected_date}T{selected_time}"
+                        }
+                    },
+                }
+            )
+            st.success("Task added to Notion!")
+    except Exception as e:
+        st.error("Failed to parse GPT response. Please try again.")
+        st.text(str(e))
